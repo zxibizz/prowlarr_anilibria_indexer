@@ -9,8 +9,13 @@
 #
 # AniLibria's API requires two round trips to turn a keyword search into
 # torrents, which the Cardigann engine (one request per search) cannot do. The
-# search path therefore points at the small companion service in ../bridge,
-# which performs that lookup and returns the rows this definition parses.
+# search path below is therefore handled by the companion proxy in ../proxy,
+# which is set as an "Http" indexer proxy in Prowlarr:
+#
+#   * this route is answered by the proxy with the flattened rows parsed here,
+#   * every other request Prowlarr makes - release pages, .torrent downloads,
+#     its own proxy health check - is relayed to the real site untouched.
+#
 # Categories, titles, dates and download URLs are all still handled here.
 #
 # Note the site moved from anilibria.tv to aniliberty.top; the old
@@ -20,7 +25,7 @@
 
 id: anilibria
 name: AniLibria
-description: "AniLibria is a Russian anime distribution platform. Requires the companion anilibria-bridge service."
+description: "AniLibria is a Russian anime distribution platform. Requires the companion anilibria-proxy to be set as an Http indexer proxy."
 language: ru-RU
 type: public
 encoding: UTF-8
@@ -43,27 +48,39 @@ caps:
   modes:
     search: [q]
 
-settings:
-  - name: info_bridge
-    type: info
-    label: Bridge service
-    default: "This indexer needs the companion <b>anilibria-bridge</b> service: AniLibria's API takes two requests to turn a keyword search into torrents, while Prowlarr's Cardigann engine can only make one. Start it with <code>docker compose up -d --build</code>. To use a bridge running elsewhere, edit <code>search.paths</code> in <code>anilibria.yml</code> - the host cannot be templated, because Prowlarr decides whether a path is absolute before it substitutes templates."
+# Deliberately no custom settings.
+#
+# Prowlarr resolves every non-standard field the UI submits against the
+# definition the server has loaded:
+#
+#     var cardigannSetting = cardigannDefinition.Settings.FirstOrDefault(x => x.Name == field.Name);
+#     if (cardigannSetting == null)
+#         throw new ArgumentOutOfRangeException(field.Name, "Unknown Cardigann setting.");
+#
+# so a custom `settings` entry that the server cannot resolve (a stale cached
+# definition, or a build that does not read them from Custom/) makes the indexer
+# impossible to save. Nothing here needs one.
+settings: []
 
 search:
   paths:
-    # Must be a literal absolute URL: Prowlarr decides whether a path is
-    # absolute (and therefore not prefixed with the site link) by parsing the
-    # raw string, before any template is substituted. Point this at
-    # http://host.docker.internal:8787/search instead if you run the bridge
-    # outside of this compose stack.
-    - path: "http://anilibria-bridge:8787/search"
+    # Answered by the proxy, never by the site. It must be a literal absolute
+    # URL: Prowlarr decides whether a path is absolute (and therefore not
+    # prefixed with the site link) by parsing the raw string, before any
+    # template is substituted.
+    #
+    # The host is the real site so the URL still resolves when the proxy is not
+    # in play -- you get a 404 from the site rather than a DNS error. Where the
+    # proxy actually runs is Prowlarr's "Http" indexer proxy setting, so this
+    # line never needs to change. Keep it in step with PROXY_DIVERT_PREFIX.
+    - path: "http://aniliberty.top/_anilibria_proxy/search"
       response:
         type: json
 
   inputs:
     q: "{{ .Keywords }}"
     # Only used for keyword-less searches (indexer test, RSS sync); the API
-    # caps /anime/torrents at 50 and the bridge clamps anyway.
+    # caps /anime/torrents at 50 and the proxy clamps anyway.
     limit: 50
 
   rows:
@@ -90,11 +107,14 @@ search:
 
     # The torrent hash is part of the URL so that releases with several torrents
     # (different quality, codec or episode range) get distinct GUIDs.
+    # The site is hardcoded because the definition cannot declare a setting for
+    # it, and .Config.sitelink comes from the Base Url dropdown, which can be
+    # empty for custom definitions.
     details:
-      text: "{{ .Config.sitelink }}anime/releases/release/{{ .Result._alias }}/{{ .Result.infohash }}"
+      text: "https://aniliberty.top/anime/releases/release/{{ .Result._alias }}/{{ .Result.infohash }}"
 
     download:
-      text: "{{ .Config.sitelink }}api/v1/anime/torrents/{{ .Result.infohash }}/file"
+      text: "https://aniliberty.top/api/v1/anime/torrents/{{ .Result.infohash }}/file"
 
     magnet:
       selector: torrent.magnet

@@ -104,6 +104,24 @@ def api_raw(path: str, method: str = "GET", body: object = None, params: dict | 
             return exc.code, raw
 
 
+# --------------------------------------------------------------------------- 0
+print("\n0. proxy preflight")
+_, proxies = api("/api/v1/indexerproxy")
+_, indexers_now = api("/api/v1/indexer")
+here = next((i for i in (indexers_now or []) if i.get("definitionName") == DEFINITION), None)
+proxy_tag_ids = {t for p in (proxies or []) for t in (p.get("tags") or [])}
+assigned = proxy_tag_ids & set((here or {}).get("tags") or [])
+if not proxies:
+    print(f"  [{INFO}] no indexer proxy configured. The definition's search route is")
+    print("         answered by the proxy, so run this first:")
+    print("         python3 scripts/configure_proxy.py")
+elif not assigned:
+    print(f"  [{INFO}] a proxy exists but is not assigned to the indexer; see")
+    print("         python3 scripts/configure_proxy.py")
+else:
+    print(f"  [{PASS}] proxy assigned to the indexer")
+
+
 # --------------------------------------------------------------------------- 1
 print("\n1. definition visibility")
 api("/api/v1/command", "POST", {"name": "IndexerDefinitionUpdate"})
@@ -138,7 +156,9 @@ payload = {
     "protocol": "torrent",
     "priority": 25,
     "appProfileId": profiles[0]["id"] if profiles else 1,
-    "tags": [],
+    # Keep any existing tag assignment: tags are how an indexer proxy is bound
+    # to an indexer, so dropping them would silently disable proxy mode.
+    "tags": (current.get("tags") or []) if current else [],
     "fields": match.get("fields", []),
 }
 
@@ -227,7 +247,7 @@ else:
 # --------------------------------------------------------------------------- 5
 print("\n5. keyword-less search (RSS sync)")
 # This is the request path Sonarr/Radarr RSS sync uses: no keywords, so the
-# bridge falls back to the newest torrents and the API's limit of 50 applies.
+# proxy falls back to the newest torrents and the API's limit of 50 applies.
 _, feed = api(
     "/api/v1/search",
     params={"type": "search", "indexerIds": [indexer_id], "limit": 25},
