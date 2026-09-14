@@ -1,0 +1,54 @@
+---
+# Prowlarr instance for developing and testing the custom AniLiberty indexer.
+#
+#   docker compose up -d --build   start (builds the bridge image)
+#   docker compose logs -f         follow logs
+#   docker compose down            stop
+#
+# Two services:
+#   prowlarr          the indexer host; ./definitions is mounted into its
+#                     "Custom" definitions folder, the only definitions folder
+#                     Prowlarr never overwrites when refreshing built-ins.
+#   anilibria-bridge  turns AniLibria's two-step search API into the single
+#                     request a Cardigann definition is able to make.
+
+services:
+  anilibria-bridge:
+    build: ./bridge
+    image: anilibria-bridge:local
+    container_name: anilibria-bridge
+    environment:
+      - ANILIBRIA_API_BASE=https://aniliberty.top/api/v1
+      # How many matched releases to expand into torrents per search.
+      - BRIDGE_MAX_RELEASES=10
+      # Politeness delay between those per-release requests, in seconds.
+      - BRIDGE_REQUEST_DELAY=0.2
+      - BRIDGE_CACHE_TTL=300
+    ports:
+      # Exposed only so you can poke at it from the host while developing.
+      - "8787:8787"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      # Keep the definition bundle from being refreshed over our work while testing.
+      # Remove/hide this once you rely on built-in definitions again.
+      # - PROWLARR__UPDATE__MECHANISM=external
+    volumes:
+      - ./config:/config
+      # Only the custom definitions folder is bind-mounted so the container's
+      # own Definitions/*.yml bundle cannot clobber our file.
+      - ./definitions:/config/Definitions/Custom
+    ports:
+      - "9696:9696"
+    extra_hosts:
+      # Lets the container reach services running on the macOS/Linux host,
+      # needed when the indexer or a helper service runs outside Docker.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+

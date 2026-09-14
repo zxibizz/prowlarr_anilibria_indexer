@@ -1,0 +1,140 @@
+---
+# AniLibria / AniLiberty custom indexer for Prowlarr.
+#
+# Drop this file into Prowlarr's custom definitions folder:
+#   Docker : /config/Definitions/Custom/anilibria.yml
+#   Linux  : ~/.config/Prowlarr/Definitions/Custom/anilibria.yml
+#   macOS  : ~/Library/Application Support/Prowlarr/Definitions/Custom/anilibria.yml
+#   Windows: C:\ProgramData\Prowlarr\Definitions\Custom\anilibria.yml
+#
+# AniLibria's API requires two round trips to turn a keyword search into
+# torrents, which the Cardigann engine (one request per search) cannot do. The
+# search path therefore points at the small companion service in ../bridge,
+# which performs that lookup and returns the rows this definition parses.
+# Categories, titles, dates and download URLs are all still handled here.
+#
+# Note the site moved from anilibria.tv to aniliberty.top; the old
+# api.anilibria.tv v3 API now answers HTTP 410 Gone.
+#
+# API docs: https://aniliberty.top/api/docs/v1
+
+id: anilibria
+name: AniLibria
+description: "AniLibria is a Russian anime distribution platform. Requires the companion anilibria-bridge service."
+language: ru-RU
+type: public
+encoding: UTF-8
+links:
+  - https://aniliberty.top/
+
+caps:
+  # release.type is one of TV, WEB, OVA, ONA, OAD, SPECIAL, MOVIE, DORAMA, so the
+  # mapping ids are the API values and no template is needed to pick one.
+  categorymappings:
+    - {id: TV, cat: TV/Anime, desc: "Аниме ТВ", default: true}
+    - {id: WEB, cat: TV/Anime, desc: "Аниме WEB"}
+    - {id: OVA, cat: TV/Anime, desc: "Аниме OVA"}
+    - {id: ONA, cat: TV/Anime, desc: "Аниме ONA"}
+    - {id: OAD, cat: TV/Anime, desc: "Аниме OAD"}
+    - {id: SPECIAL, cat: TV/Anime, desc: "Аниме спешл"}
+    - {id: MOVIE, cat: Movies/Other, desc: "Аниме фильмы"}
+    - {id: DORAMA, cat: TV, desc: "Дорамы"}
+
+  modes:
+    search: [q]
+
+settings:
+  - name: info_bridge
+    type: info
+    label: Bridge service
+    default: "This indexer needs the companion <b>anilibria-bridge</b> service: AniLibria's API takes two requests to turn a keyword search into torrents, while Prowlarr's Cardigann engine can only make one. Start it with <code>docker compose up -d --build</code>. To use a bridge running elsewhere, edit <code>search.paths</code> in <code>anilibria.yml</code> - the host cannot be templated, because Prowlarr decides whether a path is absolute before it substitutes templates."
+
+search:
+  paths:
+    # Must be a literal absolute URL: Prowlarr decides whether a path is
+    # absolute (and therefore not prefixed with the site link) by parsing the
+    # raw string, before any template is substituted. Point this at
+    # http://host.docker.internal:8787/search instead if you run the bridge
+    # outside of this compose stack.
+    - path: "http://anilibria-bridge:8787/search"
+      response:
+        type: json
+
+  inputs:
+    q: "{{ .Keywords }}"
+    # Only used for keyword-less searches (indexer test, RSS sync); the API
+    # caps /anime/torrents at 50 and the bridge clamps anyway.
+    limit: 50
+
+  rows:
+    selector: rows
+
+  fields:
+    # --- working values (must be declared before the fields that use them) ---
+    _alias:
+      selector: release.alias
+      optional: true
+
+    infohash:
+      selector: torrent.hash
+
+    # Prowlarr's template engine has no `else if`, so branching is avoided
+    # entirely: the category id is the API's own release.type value.
+    category:
+      selector: release.type
+      optional: true
+      default: TV
+
+    title:
+      selector: torrent.label
+
+    # The torrent hash is part of the URL so that releases with several torrents
+    # (different quality, codec or episode range) get distinct GUIDs.
+    details:
+      text: "{{ .Config.sitelink }}anime/releases/release/{{ .Result._alias }}/{{ .Result.infohash }}"
+
+    download:
+      text: "{{ .Config.sitelink }}api/v1/anime/torrents/{{ .Result.infohash }}/file"
+
+    magnet:
+      selector: torrent.magnet
+      optional: true
+
+    size:
+      selector: torrent.size
+
+    seeders:
+      selector: torrent.seeders
+
+    leechers:
+      selector: torrent.leechers
+      optional: true
+
+    grabs:
+      selector: torrent.grabs
+      optional: true
+
+    date:
+      selector: torrent.updated_at
+
+    year:
+      selector: release.year
+      optional: true
+
+    poster:
+      selector: release.poster
+      optional: true
+      filters:
+        - name: re_replace
+          args: ["^/", "https://aniliberty.top/"]
+
+    description:
+      selector: release.description
+      optional: true
+
+    # AniLibria is free to download and does not count upload.
+    downloadvolumefactor:
+      text: 0
+    uploadvolumefactor:
+      text: 1
+# cardigann engine
