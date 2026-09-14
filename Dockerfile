@@ -1,8 +1,9 @@
 FROM python:3.12-alpine
 
-# Only the standard library is used, so there is nothing to install.
+# Build context is the repository root; only the proxy module goes into the image.
+# Together with .dockerignore that keeps the context from dragging in config/.
 WORKDIR /app
-COPY app.py /app/app.py
+COPY proxy/app.py /app/app.py
 
 ENV PROXY_PORT=8788 \
     PYTHONUNBUFFERED=1

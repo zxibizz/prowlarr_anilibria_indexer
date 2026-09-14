@@ -72,9 +72,10 @@ indexer proxy's host and port.
 
 ```
 docker-compose.yml            Prowlarr + the proxy
+Dockerfile                    the proxy image (context is the repo root)
+.dockerignore                 keeps config/ and the rest out of the build context
 definitions/anilibria.yml     the custom indexer definition (mounted into Definitions/Custom)
 proxy/app.py                  forward proxy: diverts one route, relays the rest
-proxy/Dockerfile
 .env.example                  port and tuning for the proxy
 scripts/validate_definition.py  checks the YAML against the Cardigann v11 schema
 scripts/configure_proxy.py      registers the proxy with Prowlarr, adds the indexer

@@ -15,7 +15,9 @@
 
 services:
   anilibria-proxy:
-    build: ./proxy
+    # Dockerfile lives at the repository root; the context is the whole repo,
+    # trimmed by .dockerignore.
+    build: .
     image: anilibria-proxy:local
     container_name: anilibria-proxy
     environment:

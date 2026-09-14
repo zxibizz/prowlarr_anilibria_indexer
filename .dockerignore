@@ -1,0 +1,19 @@
+# The build context is the repository root, but the image only needs
+# proxy/app.py. Excluding the rest keeps the context small - and keeps
+# config/, which holds Prowlarr's database and logs, out of the build.
+
+.git
+.gitignore
+.cache
+.env
+.env.example
+
+# Prowlarr's app-data directory (bind-mounted at runtime, never baked in)
+config
+
+definitions
+scripts
+README.md
+
+__pycache__
+*.pyc
