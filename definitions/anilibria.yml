@@ -103,15 +103,10 @@ search:
       default: TV
 
     title:
-      selector: torrent.label
+      selector: release.name_main
 
-    # The torrent hash is part of the URL so that releases with several torrents
-    # (different quality, codec or episode range) get distinct GUIDs.
-    # The site is hardcoded because the definition cannot declare a setting for
-    # it, and .Config.sitelink comes from the Base Url dropdown, which can be
-    # empty for custom definitions.
     details:
-      text: "https://aniliberty.top/anime/releases/release/{{ .Result._alias }}/{{ .Result.infohash }}"
+      text: "https://anilibria.tv/release/{{ .Result._alias }}.html"
 
     download:
       text: "https://aniliberty.top/api/v1/anime/torrents/{{ .Result.infohash }}/file"
