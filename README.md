@@ -189,8 +189,10 @@ folder — `/config/Definitions/Custom` in Docker. Two things to know first:
 - **The `Custom` folder does not exist yet** in a stock container; only
   `/config/Definitions/` with the ~600 built-ins. Create it.
 - **Do not put the file in `/config/Definitions/` directly.** Prowlarr refreshes
-  that folder from `indexers.prowlarr.com` and overwrites it; `Custom/` is the
-  one folder the updater leaves alone.
+  that folder from `indexers.prowlarr.com` and overwrites it — and until it does,
+  a file there *shadows* the custom one. See
+  [Searches go to the old anilibria.tv API](#searches-go-to-the-old-anilibriatv-api-410-gone).
+  `Custom/` is the one folder the updater leaves alone.
 
 With this repo, `docker-compose.yml` already bind-mounts it:
 
@@ -285,6 +287,34 @@ request is an **absolute** URL, and release pages, downloads and posters hardcod
 instead of clearing it to an empty string: Prowlarr answers an empty string with
 *"Invalid URI: The URI is empty."* and refuses to save, while an untouched empty
 dropdown stores `null` and is accepted.
+
+### Searches go to the old anilibria.tv API (410 Gone)
+
+```
+Unable to connect to indexer. Unexpected response status Gone code from indexer request
+```
+
+A leftover `anilibria.yml` in `/config/Definitions/` — the built-in bundle folder
+— **shadows** the custom definition. Definitions are resolved by file name, and
+that folder is searched alongside `Custom/`, so the stray file wins.
+
+Verified by planting a legacy probe there. Prowlarr requested:
+
+```
+Adding request for AniLibria: https://api.anilibria.tv/v3/title/updates?filter=...&limit=100
+```
+
+instead of the definition's own search route, and every save or search failed
+with `410 Gone`. Note the API's schema list can still show the *custom* entry
+while requests use the stray file, so this is easy to misread. Remove it:
+
+```bash
+docker exec prowlarr rm -f /config/Definitions/anilibria.yml
+docker restart prowlarr
+```
+
+The definition updater would overwrite that file eventually, but until then it
+shadows — so only ever put custom definitions in `Custom/`.
 
 ### The indexer fails with "Unable to connect to indexer"
 
