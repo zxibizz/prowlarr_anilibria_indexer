@@ -33,6 +33,27 @@ locally with flattened search results:
 An empty ``q`` returns the newest torrents, which is what Prowlarr uses for
 indexer tests and for RSS sync.
 
+Two routes are answered locally, both under ``DIVERT_PREFIX``::
+
+    GET {DIVERT_PREFIX}/search?q=...                      flattened search rows
+    GET {DIVERT_PREFIX}/torrent/{alias}/{order}.torrent   one .torrent file
+
+The second route is what a release's GUID is addressed by. In the Cardigann
+engine ``release.Guid`` is set from the definition's ``download`` field and
+nowhere else - there is no ``guid`` field - and the torznab feed emits that GUID
+verbatim, so the download URL *is* the GUID. A URL naming the infohash therefore
+changes the GUID whenever the site regenerates the torrent file for the same
+release, and every downstream app re-grabs it. Rows instead carry a
+``download_url`` built from the release alone plus the torrent's 1-based rank by
+size, descending::
+
+    "order": 1,
+    "download_url": "http://aniliberty.top/_anilibria_proxy/torrent/honzuki/1.torrent"
+
+It names no infohash, so it survives a regenerated torrent file, and it is still
+a working download: this service resolves ``alias`` + ``order`` back to whatever
+the current infohash is, every time the file is asked for.
+
 **Every other request is relayed to its real destination** - release pages,
 ``.torrent`` downloads and Prowlarr's own proxy health check (a TLS tunnel to
 prowlarr.servarr.com) all pass straight through, so the site keeps working
@@ -42,8 +63,9 @@ That is what makes the proxy's location configurable from Prowlarr itself: the
 definition uses a fixed search path on the real site, and where this service
 actually runs is just the indexer proxy's host and port.
 
-Everything else (categories, titles, download URLs, date formatting) is left to
-the YAML definition, so the indexing logic stays in the Prowlarr config.
+Categories, titles, dates, sizes and the poster/description fields are left to the
+YAML definition, so the presentation stays in the Prowlarr config. The download
+URL is the exception: it doubles as the release's GUID, so it is built here.
 
 Local endpoints on the same listener, for humans and container health checks:
 
@@ -56,6 +78,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import select
 import socket
 import threading
@@ -73,6 +96,15 @@ PORT = int(PORT_TEXT) if PORT_TEXT.strip() else 0
 # Path prefix the proxy answers itself. It lives on the real site's host so the
 # definition's search path still resolves if the proxy is not in play.
 DIVERT_PREFIX = os.environ.get("PROXY_DIVERT_PREFIX", "/_anilibria_proxy")
+# Both diverted routes are addressed on the site's plain-http origin. That is not
+# cosmetic: the divert only ever sees absolute-form requests ("GET http://host/path"),
+# which is what Prowlarr's "Http" indexer proxy sends for plain http. An https URL
+# arrives here as CONNECT and is blind-tunnelled to the site, never reaching it.
+DIVERT_ORIGIN = "http://" + SITE.split("://", 1)[-1]
+# {DIVERT_PREFIX}/torrent/{alias}/{order}.torrent - see the module docstring.
+TORRENT_ROUTE = re.compile(
+    rf"^{re.escape(DIVERT_PREFIX)}/torrent/(?P<alias>[A-Za-z0-9._~%+-]+)/(?P<order>[0-9]+)\.torrent$"
+)
 
 HTTP_TIMEOUT = float(os.environ.get("PROXY_HTTP_TIMEOUT", "30"))
 # The API rejects limit > 50 on /anime/torrents with HTTP 422.
@@ -94,6 +126,13 @@ USER_AGENT = os.environ.get(
 
 _cache: dict[tuple[str, int], tuple[float, list]] = {}
 _cache_lock = threading.Lock()
+# Release alias (or "id:<n>") -> (expires, torrents). This is the list `order` is a
+# rank in. Cached because the RSS/latest path asks for a release it has only seen
+# one torrent of, and the .torrent route asks again when a file is grabbed, which
+# can be days after the search that found it.
+_order_cache: dict[str, tuple[float, list]] = {}
+_order_lock = threading.Lock()
+_order_lookups = 0
 _log_lock = threading.Lock()
 
 
@@ -154,6 +193,169 @@ def _as_list(payload: object) -> list:
     return []
 
 
+# ------------------------------------------------------ torrent identity: size -> order
+
+_SIZE_SUFFIXES = {
+    "": 1,
+    "b": 1,
+    "kb": 1024,
+    "kib": 1024,
+    "mb": 1024 ** 2,
+    "mib": 1024 ** 2,
+    "gb": 1024 ** 3,
+    "gib": 1024 ** 3,
+    "tb": 1024 ** 4,
+    "tib": 1024 ** 4,
+}
+
+
+def size_bytes(value: object) -> int:
+    """The API reports torrent.size as bytes; tolerate a missing or textual value."""
+    if isinstance(value, dict):
+        value = value.get("value")
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip().replace(" ", "")
+    digits = ""
+    for char in text:
+        if char.isdigit() or (char == "." and "." not in digits):
+            digits += char
+            continue
+        break
+    if not digits:
+        return 0
+    try:
+        number = float(digits)
+    except ValueError:
+        return 0
+    return int(number * _SIZE_SUFFIXES.get(text[len(digits) :].lower(), 1))
+
+
+def order_key(torrent: object) -> tuple[int, str]:
+    """Sort key for one release's torrents: size descending, id ascending.
+
+    The id breaks ties rather than the infohash, because an id does not change
+    when the site regenerates a torrent file, so equal-sized torrents keep their
+    ranks across such an update.
+    """
+    torrent = torrent if isinstance(torrent, dict) else {}
+    identifier = torrent.get("id")
+    if identifier is None:
+        identifier = torrent.get("hash")
+    return (-size_bytes(torrent.get("size")), "" if identifier is None else str(identifier))
+
+
+def ordered_torrents(torrents: object) -> list[dict]:
+    """A release's torrents, largest first. An `order` is a position in this list."""
+    if not isinstance(torrents, list):
+        return []
+    return sorted((torrent for torrent in torrents if isinstance(torrent, dict)), key=order_key)
+
+
+def torrent_order(torrent: object, torrents: object) -> int | None:
+    """1-based rank of `torrent` inside its release, or None if it cannot be placed."""
+    infohash = torrent.get("hash") if isinstance(torrent, dict) else None
+    for position, candidate in enumerate(ordered_torrents(torrents), start=1):
+        if infohash and candidate.get("hash") == infohash:
+            return position
+        if candidate is torrent:
+            return position
+    return None
+
+
+def release_key(alias: object = None, release_id: object = None) -> str | None:
+    """Cache key for one release's torrent list."""
+    if alias:
+        return str(alias)
+    if release_id is not None:
+        return f"id:{release_id}"
+    return None
+
+
+def remember_release_torrents(alias: object, release_id: object, torrents: list) -> None:
+    """Seed the rank cache from a torrent list we already fetched."""
+    if CACHE_TTL <= 0:
+        return
+    expires = time.time() + CACHE_TTL
+    keys = [key for key in (release_key(alias), release_key(None, release_id)) if key]
+    with _order_lock:
+        for key in keys:
+            _order_cache[key] = (expires, torrents)
+
+
+def release_torrents(alias: object = None, release_id: object = None, delay: bool = False) -> list[dict]:
+    """Every torrent of one release - the list `order` is a rank in.
+
+    Prefers the release object, which carries its torrents, and falls back to
+    the per-release torrent endpoint when only the numeric id is known. Both the
+    search and the .torrent route rank against this one list, which is what makes
+    a torrent's GUID the same however it was found.
+    """
+    global _order_lookups
+
+    key = release_key(alias, release_id)
+    if key is None:
+        return []
+
+    now = time.time()
+    with _order_lock:
+        hit = _order_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+
+    # The RSS/latest path expands many releases; keep the per-release lookups as
+    # polite as the search path's are.
+    if delay and _order_lookups:
+        time.sleep(REQUEST_DELAY)
+    _order_lookups += 1
+
+    torrents: list[dict] = []
+    if alias:
+        try:
+            payload = api_get(f"/anime/releases/{urllib.parse.quote(str(alias))}")
+            release = payload if isinstance(payload, dict) else {}
+            if not release.get("torrents") and isinstance(release.get("data"), dict):
+                release = release["data"]
+            torrents = [item for item in _as_list(release.get("torrents")) if isinstance(item, dict)]
+        except Exception as exc:  # noqa: BLE001 - fall back to the id lookup
+            log(f"  torrents of {alias!r}: {type(exc).__name__}: {exc}")
+
+    if not torrents and release_id is not None:
+        try:
+            payload = api_get(f"/anime/torrents/release/{release_id}")
+            torrents = [item for item in _as_list(payload) if isinstance(item, dict)]
+        except Exception as exc:  # noqa: BLE001 - ranking is best effort
+            log(f"  torrents of release {release_id}: {type(exc).__name__}: {exc}")
+
+    with _order_lock:
+        if CACHE_TTL > 0:
+            _order_cache[key] = (now + CACHE_TTL, torrents)
+        if len(_order_cache) > 512:
+            for stale in [k for k, v in _order_cache.items() if v[0] <= now]:
+                _order_cache.pop(stale, None)
+
+    return torrents
+
+
+def download_url(alias: object, order: object, infohash: object = None) -> str:
+    """The URL a release is grabbed from - and therefore that release's GUID.
+
+    The stable divert route whenever the size rank is known. The API's
+    hash-addressed file URL is only a fallback, so a row stays grabbable when the
+    extra lookup behind `order` failed; that GUID is hash-based again, which is
+    exactly what this arrangement exists to avoid.
+    """
+    if alias and isinstance(order, int) and order > 0:
+        quoted = urllib.parse.quote(str(alias), safe="")
+        return f"{DIVERT_ORIGIN}{DIVERT_PREFIX}/torrent/{quoted}/{order}.torrent"
+    if infohash:
+        return f"{SITE}/api/v1/anime/torrents/{infohash}/file"
+    return ""
+
+
 def project_release(release: object) -> dict:
     """Flatten a release object so the YAML only needs single-level selectors."""
     release = release if isinstance(release, dict) else {}
@@ -203,8 +405,18 @@ def project_torrent(torrent: object) -> dict:
     }
 
 
-def make_row(release: object, torrent: object) -> dict:
-    return {"release": project_release(release), "torrent": project_torrent(torrent)}
+def make_row(release: object, torrent: object, order: int | None = None) -> dict:
+    """One flattened row, plus the identity the release's GUID is built from."""
+    projected_release = project_release(release)
+    projected_torrent = project_torrent(torrent)
+    return {
+        "release": projected_release,
+        "torrent": projected_torrent,
+        "order": order,
+        "download_url": download_url(
+            projected_release.get("alias"), order, projected_torrent.get("hash")
+        ),
+    }
 
 
 def latest_torrents(limit: int) -> list:
@@ -222,15 +434,113 @@ def latest_torrents(limit: int) -> list:
     return []
 
 
+def release_matches(release: dict, alias: object, release_id: object) -> bool:
+    """Does a release object describe the release identified by this alias/id?"""
+    if release_id is not None and str(release.get("id")) == str(release_id):
+        return True
+    return bool(alias) and release.get("alias") == alias
+
+
+def rank_releases(identities: list[tuple]) -> dict[str, list[dict]]:
+    """The torrent list of several releases at once -- what the feed path needs.
+
+    /anime/torrents is a flat list that carries one torrent of each release, so
+    every release it mentions has to be looked up before its ranks are known.
+    Prowlarr's indexer test and its RSS sync both take that path, so the releases
+    are asked for in a single batched request first, and only whatever the batch
+    did not cover is fetched one by one. Ranking all of them is not optional: it
+    is what gives a torrent the same GUID here as in a keyword search.
+    """
+    ranking: dict[str, list[dict]] = {}
+    wanted: list[tuple[str, object, object]] = []
+
+    now = time.time()
+    with _order_lock:
+        for alias, release_id in identities:
+            key = release_key(alias, release_id)
+            if key is None or key in ranking:
+                continue
+            hit = _order_cache.get(key)
+            if hit and hit[0] > now:
+                ranking[key] = hit[1]
+            else:
+                ranking[key] = []
+                wanted.append((key, alias, release_id))
+
+    if not wanted:
+        return ranking
+
+    ids = [release_id for _, _, release_id in wanted if release_id is not None]
+    if ids:
+        try:
+            payload = api_get(
+                "/anime/releases/list",
+                {"ids": ",".join(str(release_id) for release_id in ids), "limit": len(ids)},
+            )
+            for release in _as_list(payload):
+                if not isinstance(release, dict):
+                    continue
+                torrents = [item for item in _as_list(release.get("torrents")) if isinstance(item, dict)]
+                if not torrents:
+                    continue
+                for key, alias, release_id in wanted:
+                    if release_matches(release, alias, release_id):
+                        ranking[key] = torrents
+        except Exception as exc:  # noqa: BLE001 - the batch is only an optimisation
+            log(f"  batched release lookup unavailable ({type(exc).__name__}: {exc})")
+
+    unresolved = [entry for entry in wanted if not ranking[entry[0]]]
+    if unresolved:
+        log(f"  ranking {len(unresolved)} release(s) one at a time")
+    for key, alias, release_id in unresolved:
+        ranking[key] = release_torrents(alias, release_id, delay=True)
+
+    if CACHE_TTL > 0:
+        expires = time.time() + CACHE_TTL
+        with _order_lock:
+            for key, torrents in ranking.items():
+                if torrents:
+                    _order_cache[key] = (expires, torrents)
+
+    return ranking
+
+
+def latest_rows(items: list[dict]) -> list[dict]:
+    """Rows for the newest torrents, ranked inside their own release.
+
+    Without the ranking, the same torrent would get a different GUID here than
+    from a keyword search, and downstream apps would see two releases.
+    """
+    entries = []
+    for item in items:
+        release = item.get("release") if isinstance(item.get("release"), dict) else {}
+        entries.append((item, release, release.get("alias"), release.get("id")))
+
+    ranking = rank_releases([(alias, release_id) for _, _, alias, release_id in entries])
+
+    rows: list[dict] = []
+    fallbacks = 0
+    for item, release, alias, release_id in entries:
+        torrents = ranking.get(release_key(alias, release_id) or "") or [item]
+        order = torrent_order(item, torrents)
+        if order is None:
+            fallbacks += 1
+        rows.append(make_row(release, item, order))
+
+    if fallbacks:
+        log(f"  {fallbacks} row(s) fell back to the API download URL (no size rank)")
+
+    return rows
+
+
 def search(keywords: str, limit: int) -> list[dict]:
     """Return flattened rows for a keyword search, or the newest torrents if empty."""
     keywords = (keywords or "").strip()
     rows: list[dict] = []
 
     if not keywords:
-        for item in latest_torrents(limit):
-            if isinstance(item, dict):
-                rows.append(make_row(item.get("release"), item))
+        items = [item for item in latest_torrents(limit) if isinstance(item, dict)]
+        rows = latest_rows(items)
         log(f"rss/latest: {len(rows)} rows (limit={min(limit, API_MAX_LIMIT)})")
     else:
         payload = api_get("/app/search/releases", {"query": keywords})
@@ -255,9 +565,20 @@ def search(keywords: str, limit: int) -> list[dict]:
                 log(f"  release {release_id}: {type(exc).__name__}: {exc}")
                 continue
 
-            for torrent in _as_list(torrent_payload):
-                if isinstance(torrent, dict):
-                    rows.append(make_row(torrent.get("release") or release, torrent))
+            torrents = [item for item in _as_list(torrent_payload) if isinstance(item, dict)]
+            # This response is the release's whole torrent list, so it is both the
+            # list `order` is a rank in and what the .torrent route resolves against
+            # later. Remember it, so that route does not have to ask again.
+            remember_release_torrents(release.get("alias"), release_id, torrents)
+
+            for torrent in torrents:
+                rows.append(
+                    make_row(
+                        torrent.get("release") or release,
+                        torrent,
+                        torrent_order(torrent, torrents),
+                    )
+                )
 
         log(f"search {keywords!r}: {len(rows)} torrents from {len(seen_releases)} releases")
 
@@ -326,10 +647,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     Prowlarr reaches this through its "Http" indexer proxy, so requests arrive in
     absolute form (``GET http://host/path HTTP/1.1``) and the destination is known
     without resolving it here. Anything whose path starts with ``DIVERT_PREFIX``
-    is answered locally with AniLibria search results. Everything else - release
-    pages, ``.torrent`` downloads, and Prowlarr's own proxy health check - is
+    is answered locally: the search route with AniLibria search results, and the
+    ``.torrent`` route with the torrent file that release's GUID points at.
+    Everything else - release pages and Prowlarr's own proxy health check - is
     passed straight through to the origin, so the site keeps working normally and
-    only the search hop changes.
+    only these two hops change.
     """
 
     protocol_version = "HTTP/1.1"
@@ -432,6 +754,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         path = parts.path or "/"
 
         if path.startswith(DIVERT_PREFIX):
+            torrent_route = TORRENT_ROUTE.match(path)
+            if torrent_route:
+                if method in ("GET", "HEAD"):
+                    self._serve_torrent(method, torrent_route.group("alias"), int(torrent_route.group("order")))
+                else:
+                    self.send_error(405, "the .torrent route only answers GET and HEAD")
+                return
+
             keywords, limit = parse_search_query(urllib.parse.parse_qs(parts.query))
             log(f"DIVERT {method} {parts.netloc}{path} q={keywords!r} limit={limit}")
             try:
@@ -467,7 +797,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "set this address as an Http indexer proxy in Prowlarr; requests "
                         f"under {DIVERT_PREFIX} are answered here, everything else is relayed"
                     ),
-                    "local_endpoints": {"/healthz": "liveness probe", "/": "this page"},
+                    "local_endpoints": {
+                        "/healthz": "liveness probe",
+                        "/": "this page",
+                        f"{DIVERT_PREFIX}/search": "flattened rows for the definition to parse",
+                        f"{DIVERT_PREFIX}/torrent/{{alias}}/{{order}}.torrent": (
+                            "one .torrent file; this URL is also the release's GUID"
+                        ),
+                    },
                     "settings": {
                         "divert_prefix": DIVERT_PREFIX,
                         "max_releases": MAX_RELEASES,
@@ -476,6 +813,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "api_base": API_BASE,
                     "_links": {
                         "search": f"{SITE}/api/v1/app/search/releases?query={{q}}",
+                        "torrent_by_rank": f"{DIVERT_ORIGIN}{DIVERT_PREFIX}/torrent/{{alias}}/{{order}}.torrent",
                         "torrent_file": f"{SITE}/api/v1/anime/torrents/{{hash}}/file",
                         "divert_route": f"{SITE}{DIVERT_PREFIX}/search?q={{q}}&limit=50",
                     },
@@ -484,6 +822,79 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return True
 
         return False
+
+    def _serve_torrent(self, method: str, alias: str, order: int) -> None:
+        """Answer the stable .torrent route: release + size rank -> the current file.
+
+        This is the other half of the GUID arrangement described in the module
+        docstring: the URL names the release and the rank, and the infohash - which
+        is what actually changes when a torrent file is regenerated - is looked up
+        here, at grab time, rather than baked into the GUID.
+        """
+        alias = urllib.parse.unquote(alias)
+
+        ranking = ordered_torrents(release_torrents(alias))
+        if not ranking:
+            # An empty list means either "no such release" or "the API would not
+            # answer", and the two deserve different statuses: Prowlarr treats a
+            # 4xx grab result differently from an outage. release_torrents() is
+            # deliberately non-raising, so ask once more, only on this path.
+            try:
+                api_get(f"/anime/releases/{urllib.parse.quote(alias)}")
+                status, detail = 404, f"{alias!r} has no torrents"
+            except urllib.error.HTTPError as exc:
+                status = 404 if exc.code == 404 else 502
+                detail = f"release lookup answered HTTP {exc.code}"
+            except Exception as exc:  # noqa: BLE001 - upstream is unreachable
+                status, detail = 502, f"{type(exc).__name__}: {exc}"
+            log(f"DIVERT torrent {alias}/{order}: {detail}")
+            self._send_json(status, {"error": "cannot rank torrents", "detail": detail})
+            return
+
+        if not 1 <= order <= len(ranking):
+            log(f"DIVERT torrent {alias}/{order}: {alias!r} has {len(ranking)} torrent(s)")
+            self._send_json(
+                404,
+                {"error": "no such torrent", "detail": f"{alias!r} has {len(ranking)} torrent(s)"},
+            )
+            return
+
+        torrent = ranking[order - 1]
+        infohash = torrent.get("hash")
+        if not infohash:
+            log(f"DIVERT torrent {alias}/{order}: the torrent carries no hash")
+            self._send_json(
+                502,
+                {"error": "torrent has no hash", "detail": f"{alias!r} order {order}"},
+            )
+            return
+
+        log(f"DIVERT torrent {alias}/{order} -> {infohash}")
+        try:
+            request = urllib.request.Request(
+                f"{API_BASE}/anime/torrents/{infohash}/file",
+                headers={"User-Agent": USER_AGENT, "Accept": "application/x-bittorrent"},
+            )
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                blob = response.read()
+                content_type = response.headers.get("Content-Type") or "application/x-bittorrent"
+                disposition = response.headers.get("Content-Disposition")
+        except Exception as exc:  # noqa: BLE001 - surface the failure to Prowlarr
+            log(f"DIVERT torrent {alias}/{order} failed: {type(exc).__name__}: {exc}")
+            self._send_json(
+                502,
+                {"error": "upstream request failed", "detail": f"{type(exc).__name__}: {exc}"},
+            )
+            return
+
+        filename = str(torrent.get("filename") or f"{infohash}.torrent").replace('"', "")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", disposition or f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(blob)))
+        self.end_headers()
+        if method != "HEAD":
+            self.wfile.write(blob)
 
     def _forward(self, method: str, parts: urllib.parse.SplitResult) -> None:
         length = self.headers.get("Content-Length")
@@ -546,7 +957,7 @@ def main() -> None:
     server = ThreadingHTTPServer((BIND, PORT), ProxyHandler)
     server.daemon_threads = True
     log(f"anilibria-proxy listening on {BIND}:{PORT}")
-    log(f"  diverting {DIVERT_PREFIX}/* to AniLibria search, relaying everything else")
+    log(f"  diverting {DIVERT_PREFIX}/search and {DIVERT_PREFIX}/torrent/*, relaying the rest")
     log(f"  api={API_BASE}")
 
     try:

@@ -22,6 +22,9 @@ PROXY_HOST = os.environ.get("PROXY_HOST", "localhost")
 PROXY_PORT = os.environ.get("PROXY_PORT", "8788")
 DIVERT_PREFIX = os.environ.get("PROXY_DIVERT_PREFIX", "/_anilibria_proxy")
 SITE = os.environ.get("ANILIBRIA_SITE", "https://aniliberty.top").rstrip("/")
+# The routes the proxy answers are addressed on the site's plain-http origin, which
+# is what Prowlarr's indexer proxy sends in absolute form.
+DIVERT_ORIGIN = "http://" + SITE.split("://", 1)[-1]
 PROXY_URL = f"http://{PROXY_HOST}:{PROXY_PORT}"
 QUERY = sys.argv[1] if len(sys.argv) > 1 else "naruto"
 
@@ -98,8 +101,61 @@ if rows:
         check(rows[0]["torrent"].get(field) not in (None, ""), f"torrent.{field} present")
 
 
+# --------------------------------------------------------------------------- 2b
+print("\n2b. the identity the GUID is built from")
+if rows:
+    endpoint = f"{DIVERT_ORIGIN}{DIVERT_PREFIX}/torrent/"
+    unranked = [r for r in rows if not isinstance(r.get("order"), int) or r["order"] < 1]
+    check(not unranked, "every row carries a 1-based order", f"{len(unranked)} without one")
+
+    fallbacks = [r for r in rows if not str(r.get("download_url") or "").startswith(endpoint)]
+    check(
+        not fallbacks,
+        "every row has the stable divert download url, not the infohash one",
+        str(fallbacks[0].get("download_url"))[:90] if fallbacks else "",
+    )
+
+    by_release: dict = {}
+    for row in rows:
+        if isinstance(row.get("order"), int):
+            by_release.setdefault(row["release"].get("alias"), []).append(row)
+
+    ranked_ok, sizes_desc_ok, reasons = True, True, []
+    for alias, group in by_release.items():
+        ordered = sorted(group, key=lambda r: r["order"])
+        orders = [r["order"] for r in ordered]
+        if orders != list(range(1, len(orders) + 1)):
+            ranked_ok = False
+            reasons.append(f"{alias}: orders {orders}")
+        sizes = [r["torrent"].get("size") or 0 for r in ordered]
+        if any(sizes[i] < sizes[i + 1] for i in range(len(sizes) - 1)):
+            sizes_desc_ok = False
+            reasons.append(f"{alias}: sizes {sizes}")
+    check(ranked_ok, "orders are 1..N within each release", "; ".join(reasons[:2]))
+    check(sizes_desc_ok, "order 1 is the largest torrent of its release", "; ".join(reasons[:2]))
+
+
 # --------------------------------------------------------------------------- 3
-print("\n3. everything else is relayed to the real site")
+print("\n3. the stable .torrent route the definition downloads from")
+if rows:
+    first = sorted(rows, key=lambda r: r["order"])[0]
+    url = first.get("download_url") or ""
+    status, blob = fetch(url)
+    served = status == 200 and blob[:1] == b"d" and b"announce" in blob[:4096]
+    check(served, "a row's download url serves a bencoded torrent", f"HTTP {status}, {len(blob)} bytes")
+    if served:
+        print(f"         {url}")
+
+    status, _ = fetch(f"{endpoint}no-such-release/1.torrent")
+    check(status == 404, "an unknown release answers 404", f"HTTP {status}")
+
+    alias = first["release"]["alias"]
+    status, _ = fetch(f"{endpoint}{alias}/999.torrent")
+    check(status == 404, "an out-of-range order answers 404", f"HTTP {status}")
+
+
+# --------------------------------------------------------------------------- 4
+print("\n4. everything else is relayed to the real site")
 status, _ = fetch(f"{SITE}/")
 check(status in (301, 302, 307, 308), "plain HTTP reaches the site", f"HTTP {status}")
 

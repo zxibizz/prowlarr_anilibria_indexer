@@ -54,19 +54,50 @@ flowchart LR
     S --> P
     P -->|"Http indexer proxy"| X
     X -->|"/_anilibria_proxy/search<br/>two-step lookup, flattened rows"| A["aniliberty.top/api/v1"]
-    X -->|"everything else relayed<br/>downloads, pages, health check"| A
-    A -.->|".torrent"| P
+    X -->|"/_anilibria_proxy/torrent/{alias}/{order}.torrent<br/>ranks the release, reads that file"| A
+    X -->|"everything else relayed<br/>release pages, health check"| A
 ```
 
-The proxy answers exactly one path — `/_anilibria_proxy/search` — with the
-flattened rows the definition parses, and **relays every other request to the
-real destination**. Release pages, `.torrent` downloads and Prowlarr's own proxy
-health check all pass straight through, so the site keeps working normally and
-only the search hop changes.
+The proxy answers two paths — `/_anilibria_proxy/search` with the flattened rows
+the definition parses, and `/_anilibria_proxy/torrent/{alias}/{order}.torrent`
+with the torrent file — and **relays every other request to the real
+destination**. Release pages and Prowlarr's own proxy health check pass straight
+through, so the site keeps working normally and only those two hops change.
 
 That split is what makes the proxy's location configurable from Prowlarr itself:
-the definition's search path never changes, and where the proxy runs is just the
+the definition's routes never change, and where the proxy runs is just the
 indexer proxy's host and port.
+
+### Why a result's download URL is a rank
+
+In Cardigann the value of the definition's `download` field becomes
+`ReleaseInfo.Guid`, and the torznab feed emits that GUID verbatim — there is no
+separate `guid` field to set. The download URL *is* the release's identity, so a
+URL that names the infohash gives it an identity that changes whenever the site
+regenerates a torrent file for the same release. Downstream that looks like a
+release nobody has ever grabbed, and it gets downloaded again.
+
+The proxy therefore hands out a URL built only from things that survive such an
+update: the release's alias, and the torrent's 1-based rank by size, descending.
+
+```
+http://aniliberty.top/_anilibria_proxy/torrent/honzuki-no-gekokujou/1.torrent
+```
+
+`order 1` is the release's largest torrent. The rank is re-resolved at grab time,
+so the GUID keeps working and the file that comes back is whatever the site
+serves *now*, even if the infohash changed in between. The real hash still
+travels in the result as the torznab `infohash` attribute.
+
+Ranking needs a release's *whole* torrent list, which a feed search (the indexer
+test and RSS sync) only has one torrent of — so those releases are fetched in a
+single batched request, and only whatever that batch does not cover falls back to
+a lookup per release. Release lists are cached, and a keyword search seeds the
+cache as it goes.
+
+The trade-off is worth knowing: adding a *larger* torrent to a release renumbers
+the smaller ones, and their GUIDs change with it. Updates that keep a torrent's
+size — the regeneration case above — do not.
 
 ## Layout
 
@@ -75,11 +106,11 @@ docker-compose.yml            Prowlarr + the proxy
 Dockerfile                    the proxy image (context is the repo root)
 .dockerignore                 keeps config/ and the rest out of the build context
 definitions/anilibria.yml     the custom indexer definition (mounted into Definitions/Custom)
-proxy/app.py                  forward proxy: diverts one route, relays the rest
+proxy/app.py                  forward proxy: the search and .torrent routes, rest relayed
 .env.example                  port and tuning for the proxy
 scripts/validate_definition.py  checks the YAML against the Cardigann v11 schema
 scripts/configure_proxy.py      registers the proxy with Prowlarr, adds the indexer
-scripts/test_proxy.py           the proxy alone: divert route, relaying, downloads
+scripts/test_proxy.py           the proxy alone: both divert routes, relaying, downloads
 scripts/test_indexer.py         end-to-end through Prowlarr
 scripts/check_empty_baseurl.py  indexer works with an empty Base Url
 scripts/set_logging.py          toggles Prowlarr's indexer-response logging
@@ -114,9 +145,10 @@ python3 scripts/test_indexer.py          # full path: Prowlarr -> proxy -> AniLi
 ```
 
 `test_indexer.py` deletes and re-adds the indexer (keeping its tags, so the proxy
-stays bound), runs keyword searches, checks every result has a unique GUID and an
-infohash, downloads a result and verifies it is a real bencoded torrent, and
-checks the keyword-less path that RSS sync uses. It takes queries from `argv`:
+stays bound), runs keyword searches, checks every result has a unique GUID (the
+stable `.torrent` route) and a real infohash, downloads a result and verifies it
+is a real bencoded torrent, and checks the keyword-less path that RSS sync uses.
+It takes queries from `argv`:
 
 ```bash
 python3 scripts/test_indexer.py "one piece" bleach
@@ -127,7 +159,7 @@ To confirm traffic is really being split, watch the proxy log while searching:
 ```bash
 docker compose logs --tail=30 anilibria-proxy
 #   DIVERT GET aniliberty.top/_anilibria_proxy/search q='naruto' limit=50
-#   tunnel aniliberty.top:443          <- the .torrent download
+#   DIVERT torrent honzuki-no-gekokujou/1 -> 8a8fb94b1bd22b44a116336bab6bf209d0ac3a90
 #   tunnel prowlarr.servarr.com:443    <- Prowlarr's proxy health check
 ```
 
@@ -177,8 +209,11 @@ agree. Changing the prefix is the one case where the definition needs editing.
 - **A search resolves at most `PROXY_MAX_RELEASES` releases**, so a very broad
   term can return fewer torrents than expected. Raise it at the cost of latency:
   the per-release requests are sequential and rate-limited on purpose.
-- **GUIDs are the download URLs.** Prowlarr prefers `download` over `details` as
-  the GUID source; both contain the infohash, so they are stable and unique.
+- **GUIDs are the download URLs**, because the engine takes them from `download`
+  and nowhere else. The proxy builds them as `…/torrent/{alias}/{order}`, so a
+  regenerated torrent file does not change a release's identity; adding a *larger*
+  torrent to a release does. See
+  [Why a result's download URL is a rank](#why-a-results-download-url-is-a-rank).
 - AniLibria is freeleech, so `downloadvolumefactor` is 0.
 
 ## Injecting the definition into a container

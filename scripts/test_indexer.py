@@ -34,6 +34,11 @@ PROWLARR = os.environ.get("PROWLARR_URL", "http://localhost:9696")
 DEFINITION = "anilibria"
 INDEXER_NAME = "AniLibria"
 DEFAULT_QUERIES = ["naruto", "kizumonogatari"]
+# A result's GUID is its download URL (Cardigann sets release.Guid from `download`
+# and nowhere else), and that URL is the proxy's stable .torrent route.
+DIVERT_PREFIX = os.environ.get("PROXY_DIVERT_PREFIX", "/_anilibria_proxy")
+SITE = os.environ.get("ANILIBRIA_SITE", "https://aniliberty.top").rstrip("/")
+DIVERT_ORIGIN = "http://" + SITE.split("://", 1)[-1]
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -210,6 +215,13 @@ for query in queries:
     # distinct torrents must not collapse onto one guid
     guids = {r.get("guid") for r in results}
     check(len(guids) == len(results), "every result has a unique guid", f"{len(guids)}/{len(results)}")
+
+    # The GUID must be the proxy's stable route, not the infohash-addressed API URL:
+    # the infohash changes when the site regenerates a torrent file for the same
+    # release, and a changing GUID makes downstream apps re-grab the release.
+    endpoint = f"{DIVERT_ORIGIN}{DIVERT_PREFIX}/torrent/"
+    unstable = [g for g in guids if not str(g or "").startswith(endpoint)]
+    check(not unstable, "every guid is the stable .torrent route", str(unstable[:1])[:90])
 
 
 # --------------------------------------------------------------------------- 4

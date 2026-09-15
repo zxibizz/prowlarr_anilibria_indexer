@@ -12,11 +12,14 @@
 # search path below is therefore handled by the companion proxy in ../proxy,
 # which is set as an "Http" indexer proxy in Prowlarr:
 #
-#   * this route is answered by the proxy with the flattened rows parsed here,
-#   * every other request Prowlarr makes - release pages, .torrent downloads,
-#     its own proxy health check - is relayed to the real site untouched.
+#   * a search route, answered by the proxy with the flattened rows parsed here,
+#   * a .torrent route, answered by the proxy with the file that release's GUID
+#     points at,
+#   * every other request Prowlarr makes - release pages, its own proxy health
+#     check - is relayed to the real site untouched.
 #
-# Categories, titles, dates and download URLs are all still handled here.
+# Categories, titles, dates and sizes are still handled here; the download URL is
+# not, because it is also the GUID (see the `_download_url` field below).
 #
 # Note the site moved from anilibria.tv to aniliberty.top; the old
 # api.anilibria.tv v3 API now answers HTTP 410 Gone.
@@ -114,8 +117,21 @@ search:
     details:
       text: "https://anilibria.tv/release/{{ .Result._alias }}.html"
 
+    # The download URL *is* the GUID: the Cardigann engine sets release.Guid from
+    # this field and nowhere else - there is no `guid` field - and the torznab feed
+    # emits it verbatim. So the URL cannot name the infohash: regenerating a torrent
+    # file for the same release changes the infohash, which would change the GUID
+    # and make every downstream app re-grab the release. The proxy builds this URL
+    # out of the release and the torrent's 1-based rank by size instead, and answers
+    # it itself. See ../proxy/app.py.
+    #
+    # `infohash` above stays: the real hash still travels as the torznab `infohash`
+    # attribute, it is just no longer what the GUID is made of.
+    _download_url:
+      selector: download_url
+
     download:
-      text: "https://aniliberty.top/api/v1/anime/torrents/{{ .Result.infohash }}/file"
+      text: "{{ .Result._download_url }}"
 
     magnet:
       selector: torrent.magnet
