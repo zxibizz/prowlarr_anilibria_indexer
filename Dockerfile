@@ -6,7 +6,13 @@ WORKDIR /app
 COPY proxy/app.py /app/app.py
 
 ENV PROXY_PORT=8788 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Stateless and needs nothing writable, so it fits a read-only root filesystem and
+# Kubernetes' "restricted" Pod Security profile. The uid is numeric on purpose:
+# runAsNonRoot can only verify a numeric USER.
+USER 1000:1000
 
 EXPOSE 8788
 

@@ -99,11 +99,21 @@ The trade-off is worth knowing: adding a *larger* torrent to a release renumbers
 the smaller ones, and their GUIDs change with it. Updates that keep a torrent's
 size — the regeneration case above — do not.
 
+## Image
+
+GitHub Actions (`.github/workflows/image.yml`) runs the offline tests, builds the image,
+smoke-tests it (non-root, read-only rootfs, `/healthz`) and on every push to `main`
+publishes it to `ghcr.io/zxibizz/prowlarr_anilibria_indexer` with the tags `main`,
+`sha-<short>` and `main-<YYYYMMDDhhmmss>-<short>`. The timestamped tag is what the
+homelab's Flux follows to roll out new builds.
+
 ## Layout
 
 ```
 docker-compose.yml            Prowlarr + the proxy
-Dockerfile                    the proxy image (context is the repo root)
+Dockerfile                    the proxy image (context is the repo root, runs as uid 1000)
+.github/workflows/image.yml   CI: tests, build, smoke test, push to GHCR
+tests/                        offline unit tests (python -m unittest discover -s tests)
 .dockerignore                 keeps config/ and the rest out of the build context
 definitions/anilibria.yml     the custom indexer definition (mounted into Definitions/Custom)
 proxy/app.py                  forward proxy: the search and .torrent routes, rest relayed

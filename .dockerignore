@@ -17,3 +17,5 @@ README.md
 
 __pycache__
 *.pyc
+tests
+.github
